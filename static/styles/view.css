@@ -1,0 +1,26 @@
+body {
+	background: #000000;
+	color: #ffffff;
+	font-family: "Arial";
+	
+	overflow: hidden;
+	
+	margin: 0;
+	padding: 0;
+}
+
+.view-container {
+	position: absolute;
+	width: 100vw;
+	height: 100vh;
+	
+	display: flex;
+	justify-content: center;
+	align-items: center;
+}
+
+.full-screen {
+	max-width: 100vw;
+	max-height: 100vh;
+	background: #222222;
+}
