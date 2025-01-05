@@ -49,14 +49,14 @@ impl Database {
         Ok(Database { conn })
     }
 
-    pub fn get_hash_for(&self, code: &str) -> Result<(String, String)> {
+    pub fn get_hash_for(&self, code: &str) -> Result<Option<(String, String)>> {
         let mut stmt = handle_result!(self.conn.prepare("SELECT hash, content_type FROM file WHERE code = ?1"));
         let mut rows = handle_result!(stmt.query([code]));
         let row = handle_result!(rows.next());
         if let Some(data) = row {
-            return Ok((handle_result!(data.get(0)), handle_result!(data.get(1))));
+            return Ok(Some((handle_result!(data.get(0)), handle_result!(data.get(1)))));
         }
 
-        Err(String::from("Invalid code"))
+        Ok(None)
     }
 }
