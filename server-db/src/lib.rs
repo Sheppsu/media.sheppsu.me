@@ -18,8 +18,30 @@ macro_rules! timestamp {
     () => { SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() };
 }
 
+macro_rules! result_typedef {
+    ($($name:ident: $typ:ty;)*) => {
+        mod db_result {
+            use super::Result;
+            $(
+                pub type $name = Result<$typ>;
+            )*
+        }
+        mod db_future {
+            use super::{DatabaseCommandFuture, Result};
+            $(
+                pub type $name = DatabaseCommandFuture<Result<$typ>>;
+            )*
+        }
+    };
+}
 
 type Result<T> = std::result::Result<T, String>;
+
+result_typedef!(
+    GetFile: Option<(String, String, String)>;
+    UpdateFile: ();
+    AddFile: ();
+);
 
 
 fn init_db(conn: &Connection) -> Result<()> {
@@ -61,7 +83,7 @@ impl Database {
         Ok(Database { conn })
     }
 
-    pub fn get_file_for(&self, code: &str) -> Result<Option<(String, String, String)>> {
+    pub fn get_file_for(&self, code: &str) -> db_result::GetFile {
         let mut stmt = handle_result!(self.conn.prepare("SELECT hash, content_type, file_ext FROM file WHERE code = ?1"));
         let mut rows = handle_result!(stmt.query([code]));
         let row = handle_result!(rows.next());
@@ -76,7 +98,7 @@ impl Database {
         Ok(None)
     }
 
-    pub fn update_file_stats(&self, code: &str) -> Result<()> {
+    pub fn update_file_stats(&self, code: &str) -> db_result::UpdateFile {
         handle_result!(self.conn.execute(
             "UPDATE file SET views = views + 1, last_viewed = ?1 WHERE code = ?2",
             params![timestamp!(), code]
@@ -85,7 +107,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn add_file(&self, code: &str, hash: &str, content_type: &str, file_ext: &str) -> Result<()> {
+    pub fn add_file(&self, code: &str, hash: &str, content_type: &str, file_ext: &str) -> db_result::AddFile {
         handle_result!(self.conn.execute(
             "INSERT INTO file (code, hash, last_viewed, content_type, file_ext) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![code, hash, timestamp!(), content_type, file_ext]
@@ -137,27 +159,42 @@ impl<T> Future for DatabaseCommandFuture<T> {
     }
 }
 
-// TODO: macro
-type GetFileResult = Result<Option<(String, String, String)>>;
-type GetFileFuture = DatabaseCommandFuture<GetFileResult>;
-type UpdateFileResult = Result<()>;
-type UpdateFileFuture = DatabaseCommandFuture<UpdateFileResult>;
-type AddFileResult = Result<()>;
-type AddFileFuture = DatabaseCommandFuture<AddFileResult>;
-
 type DatabaseCaller = Box<dyn FnOnce(&Database) -> () + Send>;
 
-pub struct DatabaseAsyncWrapper {
+pub struct AsyncDatabase {
     tx: mpsc::Sender<DatabaseCaller>,
 }
 
-impl DatabaseAsyncWrapper {
-    pub fn new(db: Database) -> Self {
+macro_rules! async_db_fn {
+    ($name:ident, $typ:ident; $($arg:ident)*) => {
+        pub async fn $name(&self, $($arg: &str,)*) -> db_result::$typ {
+            $(
+                let $arg = String::from($arg);
+            )*
+
+            let mut future = db_future::$typ::new();
+            let future = Pin::new(&mut future);
+            let state = future.0.clone();
+
+            handle_result!(
+                self.tx.send(Box::new(move |db| {
+                    state.lock().unwrap().resolve(db.$name($(&$arg,)*));
+                }))
+            );
+
+            future.await
+        }
+    };
+}
+
+impl AsyncDatabase {
+    pub fn new(path: &str) -> Result<Self> {
+        let db = Database::new(path)?;
         let (tx, rx) = mpsc::channel();
 
         thread::spawn(move || Self::__run(db, rx));
 
-        DatabaseAsyncWrapper { tx }
+        Ok(AsyncDatabase { tx })
     }
 
     fn __run(db: Database, rx: Receiver<DatabaseCaller>) {
@@ -174,54 +211,7 @@ impl DatabaseAsyncWrapper {
         }
     }
 
-    pub async fn get_file_for(&self, code: &str) -> Result<Option<(String, String, String)>> {
-        let movable_code = String::from(code);
-
-        let mut future = GetFileFuture::new();
-        let future = Pin::new(&mut future);
-        let state = future.0.clone();
-
-        handle_result!(
-            self.tx.send(Box::new(move |db| {
-                state.lock().unwrap().resolve(db.get_file_for(&movable_code));
-            }))
-        );
-
-        future.await
-    }
-
-    pub async fn update_file_stats(&self, code: &str) -> UpdateFileResult {
-        let movable_code = String::from(code);
-
-        let mut future = UpdateFileFuture::new();
-        let future = Pin::new(&mut future);
-        let state = future.0.clone();
-
-        handle_result!(
-            self.tx.send(Box::new(move |db| {
-                state.lock().unwrap().resolve(db.update_file_stats(&movable_code));
-            }))
-        );
-
-        future.await
-    }
-
-    pub async fn add_file(&self, code: &str, hash: &str, content_type: &str, file_ext: &str) -> AddFileResult {
-        let movable_code = String::from(code);
-        let movable_hash = String::from(hash);
-        let movable_content_type = String::from(content_type);
-        let movable_file_ext = String::from(file_ext);
-
-        let mut future = AddFileFuture::new();
-        let future = Pin::new(&mut future);
-        let state = future.0.clone();
-
-        handle_result!(
-            self.tx.send(Box::new(move |db| {
-                state.lock().unwrap().resolve(db.add_file(&movable_code, &movable_hash, &movable_content_type, &movable_file_ext));
-            }))
-        );
-
-        future.await
-    }
+    async_db_fn!(get_file_for, GetFile; code);
+    async_db_fn!(update_file_stats, UpdateFile; code);
+    async_db_fn!(add_file, AddFile; code hash content_type file_ext);
 }

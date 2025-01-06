@@ -15,13 +15,13 @@ use mime::Mime;
 use sha2::{Digest, Sha256};
 use rand::distributions::{Alphanumeric, DistString};
 use dotenv::dotenv;
-use server_db::{Database, DatabaseAsyncWrapper};
+use server_db::AsyncDatabase;
 
 
 type Result<T, E = AppError> = std::result::Result<T, E>;
 
 struct AppState {
-    db: DatabaseAsyncWrapper,
+    db: AsyncDatabase,
     api_key: Arc<String>,
     base_url: Arc<String>
 }
@@ -29,7 +29,7 @@ struct AppState {
 impl AppState {
     pub fn new(api_key: Arc<String>, base_url: Arc<String>) -> Result<AppState, String> {
         Ok(AppState {
-            db: DatabaseAsyncWrapper::new(Database::new("files.db")?),
+            db: AsyncDatabase::new("files.db")?,
             api_key,
             base_url
         })
