@@ -1,9 +1,8 @@
 use std::str::FromStr;
 use std::fmt::{Display, Formatter, Debug};
 use std::io::Read;
-use std::pin::Pin;
 use std::error::Error;
-
+use std::sync::Arc;
 use actix_web as axw;
 use actix_files as axf;
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, ResponseError};
@@ -16,20 +15,24 @@ use mime::Mime;
 use sha2::{Digest, Sha256};
 use rand::distributions::{Alphanumeric, DistString};
 use dotenv::dotenv;
-use server_db::Database;
+use server_db::{Database, DatabaseAsyncWrapper};
 
 
 type Result<T, E = AppError> = std::result::Result<T, E>;
 
 struct AppState {
-    db: Database,
-    api_key: Pin<String>,
-    base_url: Pin<String>
+    db: DatabaseAsyncWrapper,
+    api_key: Arc<String>,
+    base_url: Arc<String>
 }
 
 impl AppState {
-    pub fn new(api_key: Pin<String>, base_url: Pin<String>) -> Result<AppState, String> {
-        Ok(AppState { db: Database::new("files.db")?, api_key, base_url })
+    pub fn new(api_key: Arc<String>, base_url: Arc<String>) -> Result<AppState, String> {
+        Ok(AppState {
+            db: DatabaseAsyncWrapper::new(Database::new("files.db")?),
+            api_key,
+            base_url
+        })
     }
 }
 
@@ -103,7 +106,8 @@ async fn status() -> Result<impl Responder> {
 #[axw::get("/{code}")]
 async fn query(state: axw::web::Data<AppState>, path: axw::web::Path<(String,)>) -> Result<impl Responder> {
     let code = path.into_inner().0;
-    if let Some((hash, content_type, file_ext)) = handle_result!(state.db.get_file_for(&code)) {
+    if let Some((hash, content_type, file_ext)) = handle_result!(state.db.get_file_for(&code).await) {
+        handle_result!(state.db.update_file_stats(&code).await);
         return Ok(
             axf::NamedFile::open_async(format!("files/{}", hash))
                 .await
@@ -161,7 +165,7 @@ async fn upload(
 
         f.file.persist(path).map_err(|e| AppError::from(e.to_string()))?;
 
-        state.db.add_file(&code, &hash, &content_type, file_ext)?;
+        state.db.add_file(&code, &hash, &content_type, file_ext).await?;
     }
 
     Ok(
@@ -173,8 +177,8 @@ async fn upload(
 #[axw::main]
 async fn main() -> std::io::Result<()> {
     dotenv().ok();
-    let api_key = Pin::new(std::env::var("API_KEY").unwrap());
-    let base_url = Pin::new(std::env::var("BASE_URL").unwrap());
+    let api_key = Arc::new(std::env::var("API_KEY").unwrap());
+    let base_url = Arc::new(std::env::var("BASE_URL").unwrap());
     let port = std::env::var("PORT").unwrap();
     let log_level = std::env::var("LOG_LEVEL").unwrap_or(String::from("info"));
 

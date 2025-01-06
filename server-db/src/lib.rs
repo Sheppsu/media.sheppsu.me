@@ -1,8 +1,12 @@
+use std::future::Future;
+use std::task::{Context, Poll, Waker};
+use std::pin::Pin;
+use std::time::SystemTime;
+use std::thread;
+use std::sync::{mpsc, mpsc::Receiver, Arc, Mutex};
+
 use rusqlite::Connection;
 use rusqlite::params;
-
-use std::time::SystemTime;
-
 
 macro_rules! handle_result {
     ($result:expr) => {
@@ -88,5 +92,136 @@ impl Database {
         ));
 
         Ok(())
+    }
+}
+
+unsafe impl Send for Database {}
+
+struct DatabaseCommandFuture<T>(Arc<Mutex<DatabaseCommandFutureState<T>>>);
+struct DatabaseCommandFutureState<T> {
+    result: Option<T>,
+    waker: Option<Waker>,
+}
+
+impl<T> DatabaseCommandFutureState<T> {
+    pub fn new() -> Self {
+        DatabaseCommandFutureState { result: None, waker: None }
+    }
+
+    pub fn resolve(&mut self, result: T) {
+        self.result.replace(result);
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+impl<T> DatabaseCommandFuture<T> {
+    pub fn new() -> Self {
+        DatabaseCommandFuture(Arc::new(Mutex::new(DatabaseCommandFutureState::new())))
+    }
+}
+
+impl<T> Future for DatabaseCommandFuture<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self.0.lock().unwrap();
+        match state.result.take() {
+            Some(result) => Poll::Ready(result),
+            None => {
+                state.waker.replace(ctx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+// TODO: macro
+type GetFileResult = Result<Option<(String, String, String)>>;
+type GetFileFuture = DatabaseCommandFuture<GetFileResult>;
+type UpdateFileResult = Result<()>;
+type UpdateFileFuture = DatabaseCommandFuture<UpdateFileResult>;
+type AddFileResult = Result<()>;
+type AddFileFuture = DatabaseCommandFuture<AddFileResult>;
+
+type DatabaseCaller = Box<dyn FnOnce(&Database) -> () + Send>;
+
+pub struct DatabaseAsyncWrapper {
+    tx: mpsc::Sender<DatabaseCaller>,
+}
+
+impl DatabaseAsyncWrapper {
+    pub fn new(db: Database) -> Self {
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || Self::__run(db, rx));
+
+        DatabaseAsyncWrapper { tx }
+    }
+
+    fn __run(db: Database, rx: Receiver<DatabaseCaller>) {
+        loop {
+            let func = match rx.recv() {
+                Ok(func) => func,
+                Err(_) => {
+                    // TODO: start the thread again if it should be still running
+                    log::info!("DatabaseAsyncWrapper::__run thread is ending due to lost connection");
+                    return;
+                },
+            };
+            func(&db);
+        }
+    }
+
+    pub async fn get_file_for(&self, code: &str) -> Result<Option<(String, String, String)>> {
+        let movable_code = String::from(code);
+
+        let mut future = GetFileFuture::new();
+        let future = Pin::new(&mut future);
+        let state = future.0.clone();
+
+        handle_result!(
+            self.tx.send(Box::new(move |db| {
+                state.lock().unwrap().resolve(db.get_file_for(&movable_code));
+            }))
+        );
+
+        future.await
+    }
+
+    pub async fn update_file_stats(&self, code: &str) -> UpdateFileResult {
+        let movable_code = String::from(code);
+
+        let mut future = UpdateFileFuture::new();
+        let future = Pin::new(&mut future);
+        let state = future.0.clone();
+
+        handle_result!(
+            self.tx.send(Box::new(move |db| {
+                state.lock().unwrap().resolve(db.update_file_stats(&movable_code));
+            }))
+        );
+
+        future.await
+    }
+
+    pub async fn add_file(&self, code: &str, hash: &str, content_type: &str, file_ext: &str) -> AddFileResult {
+        let movable_code = String::from(code);
+        let movable_hash = String::from(hash);
+        let movable_content_type = String::from(content_type);
+        let movable_file_ext = String::from(file_ext);
+
+        let mut future = AddFileFuture::new();
+        let future = Pin::new(&mut future);
+        let state = future.0.clone();
+
+        handle_result!(
+            self.tx.send(Box::new(move |db| {
+                state.lock().unwrap().resolve(db.add_file(&movable_code, &movable_hash, &movable_content_type, &movable_file_ext));
+            }))
+        );
+
+        future.await
     }
 }
