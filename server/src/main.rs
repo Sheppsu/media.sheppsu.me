@@ -2,12 +2,16 @@ use std::str::FromStr;
 use std::fmt::{Display, Formatter, Debug};
 use std::io::Read;
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::future::Future;
+
 use actix_web as axw;
 use actix_files as axf;
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, ResponseError};
-use actix_web::http::StatusCode;
-use actix_web::body::BoxBody;
+use actix_web::http::{Method, StatusCode};
+use actix_web::body::{BoxBody, SizedStream};
 use actix_multipart::form::MultipartForm;
 use actix_multipart::form::tempfile::TempFile;
 use actix_web::http::header::{ContentDisposition, DispositionParam, DispositionType};
@@ -15,6 +19,12 @@ use mime::Mime;
 use sha2::{Digest, Sha256};
 use rand::distributions::{Alphanumeric, DistString};
 use dotenv::dotenv;
+use futures_core::stream::Stream;
+use bytes::Bytes;
+use futures_core::future::BoxFuture;
+use tokio::fs;
+use tokio::io::AsyncReadExt;
+
 use server_db::AsyncDatabase;
 
 
@@ -96,6 +106,10 @@ macro_rules! handle_result {
     ($result:expr) => {
         $result.map_err(|e| AppError::from(e))?
     };
+
+    (to_str; $result:expr) => {
+        $result.map_err(|e| AppError::from(e.to_string()))?
+    }
 }
 
 #[axw::get("/status")]
@@ -103,20 +117,129 @@ async fn status() -> Result<impl Responder> {
     Ok("OK")
 }
 
-#[axw::get("/{code}")]
-async fn query(state: axw::web::Data<AppState>, path: axw::web::Path<(String,)>) -> Result<impl Responder> {
+struct FileStreamState {
+    file_fut: Option<BoxFuture<'static, std::io::Result<fs::File>>>,
+    read_fut: Option<BoxFuture<'static, Result<(Bytes, Option<fs::File>), AppError>>>
+}
+
+impl FileStreamState {
+    pub fn new(path: &str) -> Self {
+        let path = String::from(path);
+        FileStreamState {
+            file_fut: Some(Box::pin(fs::File::open(path))),
+            read_fut: None
+        }
+    }
+
+    pub fn empty() -> Self {
+        FileStreamState {
+            file_fut: None,
+            read_fut: Some(Box::pin(async { Ok((Bytes::new(), None)) }))
+        }
+    }
+}
+
+struct FileStream(Arc<Mutex<FileStreamState>>);
+
+impl FileStream {
+    pub fn from_path(path: &str) -> Self {
+        FileStream(Arc::new(Mutex::new(FileStreamState::new(path))))
+    }
+
+    pub fn empty() -> Self {
+        FileStream(Arc::new(Mutex::new(FileStreamState::empty())))
+    }
+
+    fn __make_read_fut(mut file: fs::File) -> BoxFuture<'static, Result<(Bytes, Option<fs::File>), AppError>> {
+        Box::pin(async move {
+            let mut buf = vec![0_u8; 2097152];
+            let len = handle_result!(to_str; file.read(&mut buf).await);
+            if len == 0 {
+                Ok((Bytes::new(), None))
+            } else {
+                buf.resize(len, 0);
+                Ok((Bytes::from(buf), Some(file)))
+            }
+        })
+    }
+}
+
+impl Stream for FileStream {
+    type Item = Result<Bytes, AppError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut state = self.0.lock().unwrap();
+
+        // check file future (opening the file)
+        if let Some(mut file_fut) = state.file_fut.take() {
+            return match Pin::new(&mut file_fut).poll(cx) {
+                Poll::Pending => {
+                    state.file_fut.replace(file_fut);
+                    Poll::Pending
+                },
+                Poll::Ready(result) => {
+                    match result {
+                        Ok(file) => {
+                            state.read_fut.replace(FileStream::__make_read_fut(file));
+                            // immediately wake to start polling the read future
+                            cx.waker().clone().wake();
+                            Poll::Pending
+                        },
+                        Err(e) => Poll::Ready(Some(Err(AppError::from(e.to_string()))))
+                    }
+                }
+            };
+        }
+
+        // check read future (reading bytes from the file)
+        if let Some(mut read_fut) = state.read_fut.take() {
+            return match Pin::new(&mut read_fut).poll(cx) {
+                Poll::Pending => {
+                    state.read_fut.replace(read_fut);
+                    Poll::Pending
+                },
+                Poll::Ready(result) => {
+                    match result {
+                        Ok((bytes, file)) => {
+                            if let Some(file) = file {
+                                state.read_fut.replace(FileStream::__make_read_fut(file));
+                            }
+                            Poll::Ready(Some(Ok(bytes)))
+                        },
+                        Err(e) => Poll::Ready(Some(Err(e)))
+                    }
+                }
+            }
+        }
+
+        // Done reading
+        Poll::Ready(None)
+    }
+}
+
+#[axw::route("/{code}", method = "GET", method = "HEAD")]
+async fn query(state: axw::web::Data<AppState>, method: Method, path: axw::web::Path<(String,)>) -> Result<impl Responder> {
     let code = path.into_inner().0;
     if let Some((hash, content_type, file_ext)) = handle_result!(state.db.get_file_for(&code).await) {
         handle_result!(state.db.update_file_stats(&code).await);
+
+        let path = format!("files/{}", hash);
+        let file_md = handle_result!(to_str; std::fs::metadata(&path));
+
+        let stream = match method {
+            Method::GET => FileStream::from_path(&path),
+            Method::HEAD => FileStream::empty(),
+            _ => unreachable!()
+        };
+
         return Ok(
-            axf::NamedFile::open_async(format!("files/{}", hash))
-                .await
-                .map_err(|e| AppError::from(e.to_string()))?
-                .set_content_type(Mime::from_str(&content_type).unwrap())
-                .set_content_disposition(ContentDisposition {
+            HttpResponse::Ok()
+                .content_type(Mime::from_str(&content_type).unwrap())
+                .insert_header(("Content-Disposition", ContentDisposition {
                     disposition: DispositionType::Inline,
                     parameters: vec![DispositionParam::Filename(format!("{}.{}", &code, &file_ext))],
-                })
+                }))
+                .body(SizedStream::new(file_md.len(), stream))
         );
     }
 
@@ -181,6 +304,7 @@ async fn main() -> std::io::Result<()> {
     let base_url = Arc::new(std::env::var("BASE_URL").unwrap());
     let port = std::env::var("PORT").unwrap();
     let log_level = std::env::var("LOG_LEVEL").unwrap_or(String::from("info"));
+    let workers = std::env::var("WORKERS").unwrap_or(String::from("4"));
 
     std::env::set_var("RUST_LOG", log_level);
     env_logger::init();
@@ -194,7 +318,8 @@ async fn main() -> std::io::Result<()> {
             .service(upload)
             .service(query)
     })
-        .bind(("127.0.0.1", u16::from_str(&port).unwrap()))?
+        .bind(("127.0.0.1", u16::from_str(&port).expect("Failed to parse 'PORT' env variable")))?
+        .workers(usize::from_str(&workers).expect("Failed to parse 'WORKERS' env variable"))
         .run()
         .await
 }
