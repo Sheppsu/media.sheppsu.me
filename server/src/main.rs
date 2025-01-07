@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use rand::distributions::{Alphanumeric, DistString};
 use dotenv::dotenv;
 use futures_core::stream::Stream;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_core::future::BoxFuture;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
@@ -152,13 +152,12 @@ impl FileStream {
 
     fn __make_read_fut(mut file: fs::File) -> BoxFuture<'static, Result<(Bytes, Option<fs::File>), AppError>> {
         Box::pin(async move {
-            let mut buf = vec![0_u8; 2097152];
+            let mut buf = BytesMut::zeroed(2097152);  // 2MiB
             let len = handle_result!(to_str; file.read(&mut buf).await);
             if len == 0 {
                 Ok((Bytes::new(), None))
             } else {
-                buf.resize(len, 0);
-                Ok((Bytes::from(buf), Some(file)))
+                Ok((buf.split_to(len).freeze(), Some(file)))
             }
         })
     }
@@ -293,8 +292,13 @@ async fn upload(
 
     Ok(
         HttpResponse::build(StatusCode::OK)
-            .body(String::from(format!("{{\"url\": \"{}{}\"}}", state.base_url, &code)))
+            .body(String::from(format!("{{\"url\": \"{}?v={}\"}}", state.base_url, &code)))
     )
+}
+
+#[axw::get("/")]
+async fn index() -> Result<axf::NamedFile> {
+    Ok(handle_result!(to_str; axf::NamedFile::open("pages/index.html")))
 }
 
 #[axw::main]
@@ -314,6 +318,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(axw::middleware::Logger::default())
             .app_data(axw::web::Data::new(AppState::new(api_key.clone(), base_url.clone()).expect("Failed to open database")))
             .service(axf::Files::new("/static", "./static/").prefer_utf8(true))
+            .service(index)
             .service(status)
             .service(upload)
             .service(query)
