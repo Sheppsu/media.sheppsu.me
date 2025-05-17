@@ -1,6 +1,5 @@
 use std::str::FromStr;
 use std::fmt::{Display, Formatter, Debug};
-use std::io::Read;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::pin::Pin;
@@ -264,18 +263,19 @@ async fn upload(
 
     let mut code = String::new();
 
-    for mut f in form.files {
+    for f in form.files {
+        let mut file = fs::File::open(&f.file).await.map_err(|e| AppError::from(e.to_string()))?;
+
         let mut hasher = Sha256::new();
-        let mut buf: [u8; 4096] = [0; 4096];
+        let mut buf: [u8; 2097152] = [0; 2097152];  // 2MiB
         loop {
-            let n = f.file.read(&mut buf).map_err(|e| AppError::from(e.to_string()))?;
+            let n = file.read(&mut buf).await.map_err(|e| AppError::from(e.to_string()))?;
             if n == 0 {
                 break;
             }
             hasher.update(&buf[..n]);
         }
 
-        // todo: check if hash already exists
         let hash = hex::encode(hasher.finalize().as_slice());
         let path = format!("files/{}", &hash);
         code = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
@@ -285,6 +285,7 @@ async fn upload(
             None => ""
         };
 
+        // todo: check if hash already exists
         f.file.persist(path).map_err(|e| AppError::from(e.to_string()))?;
 
         state.db.add_file(&code, &hash, &content_type, file_ext).await?;
@@ -298,7 +299,7 @@ async fn upload(
 
 #[axw::get("/")]
 async fn index() -> Result<axf::NamedFile> {
-    Ok(handle_result!(to_str; axf::NamedFile::open("pages/index.html")))
+    Ok(handle_result!(to_str; axf::NamedFile::open_async("pages/index.html").await))
 }
 
 #[axw::main]
