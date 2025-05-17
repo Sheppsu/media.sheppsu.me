@@ -267,7 +267,7 @@ async fn upload(
         let mut file = fs::File::open(&f.file).await.map_err(|e| AppError::from(e.to_string()))?;
 
         let mut hasher = Sha256::new();
-        let mut buf: [u8; 2097152] = [0; 2097152];  // 2MiB
+        let mut buf = BytesMut::zeroed(2097152);  // 2MiB
         loop {
             let n = file.read(&mut buf).await.map_err(|e| AppError::from(e.to_string()))?;
             if n == 0 {
